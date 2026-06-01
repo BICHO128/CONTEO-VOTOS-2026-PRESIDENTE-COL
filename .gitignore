@@ -1,0 +1,6 @@
+.env
+*.log
+temp_imagenes/
+__pycache__/
+*.pyc
+Release-26.02.0-0.zip
