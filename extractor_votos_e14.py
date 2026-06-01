@@ -44,6 +44,7 @@ from pdf2image import convert_from_path
 RUTA_RAIZ         = Path(r"D:\PROYECTOS VSCODE\conteo_votos_2026_presidente_col")
 RUTA_CARPETA_E14  = RUTA_RAIZ / "E14"
 RUTA_EXCEL_SALIDA = RUTA_RAIZ / "consolidado_votos_2026.xlsx"
+RUTA_CACHE_JSON   = RUTA_RAIZ / "_cache_votos.json"   # Almacén incremental (no va al Excel)
 
 RUTA_POPPLER_WINDOWS: Path | None = (
     RUTA_RAIZ / "Release-26.02.0-0" / "poppler-24.02.0" / "Library" / "bin"
@@ -78,48 +79,47 @@ logger = logging.getLogger(__name__)
 PROMPT_EXTRACCION = """Eres un experto en lectura de actas electorales (Formulario E-14 Colombia).
 Tu única tarea es extraer la información visual y devolver EXCLUSIVAMENTE un JSON válido.
 
-REGLAS DE LECTURA DE VOTOS (COLUMNA "VOTACIÓN"):
-La casilla de votación tiene EXACTAMENTE 3 posiciones: [centenas] [decenas] [unidades].
-Los jurados rellenan las posiciones VACÍAS con símbolos decorativos: asterisco ✱ * , punto •, guión -, cruz ×.
-ESTOS SÍMBOLOS DECORATIVOS NO SON NÚMEROS. IGNÓRALOS COMPLETAMENTE.
-Solo los dígitos reales (0 1 2 3 4 5 6 7 8 9) cuentan. Concaténalos de izquierda a derecha.
+REGLA FUNDAMENTAL DE LECTURA DE VOTOS:
+La casilla tiene 3 posiciones: [centenas] [decenas] [unidades].
+Los símbolos ✱ * • - × son RELLENO VACÍO. NO son números. NO los cuentes.
+SOLO los dígitos 0 1 2 3 4 5 6 7 8 9 forman el número. Concaténalos.
 
-TABLA DE CONVERSIÓN OBLIGATORIA (aprende estos patrones de memoria):
-  ✱ ✱ ✱  →  0     (sin dígitos = cero)
-  • • •  →  0
-  ✱ ✱ 0  →  0
-  ✱ ✱ 1  →  1     ← MUY IMPORTANTE: los dos ✱ NO son el número 2, son relleno vacío
-  ✱ ✱ 2  →  2     ← los ✱ delante NO se cuentan
-  ✱ ✱ 3  →  3
-  ✱ ✱ 5  →  5
-  ✱ ✱ 9  →  9
-  ✱ 1 0  →  10    ← un ✱ + dígito 1 + dígito 0 = 10
-  ✱ 1 5  →  15
-  ✱ 2 1  →  21
-  ✱ 3 5  →  35
-  ✱ 4 8  →  48
-  ✱ 7 3  →  73
-  ✱ 7 5  →  75
-  ✱ 8 2  →  82
-  ✱ 9 0  →  90
-  1 0 0  →  100
-  2 1 7  →  217
+TABLA DE CONVERSIÓN — APRENDE ESTOS PATRONES:
+  ✱ ✱ ✱  →  0      ✱ ✱ 0  →  0
+  ✱ ✱ 1  →  1      ✱ ✱ 2  →  2      ✱ ✱ 3  →  3
+  ✱ ✱ 4  →  4      ✱ ✱ 5  →  5      ✱ ✱ 6  →  6
+  ✱ ✱ 7  →  7      ✱ ✱ 8  →  8      ✱ ✱ 9  →  9
+  ✱ 1 0  →  10     ✱ 1 5  →  15     ✱ 2 0  →  20
+  ✱ 2 5  →  25     ✱ 3 5  →  35     ✱ 4 8  →  48
+  ✱ 7 3  →  73     ✱ 7 5  →  75     ✱ 8 2  →  82
+  ✱ 9 0  →  90     1 0 0  →  100    2 1 7  →  217
 
-REGLA UNIVERSAL: elimina todos los símbolos que NO sean dígitos 0-9, luego lee el número resultante.
-Si no queda ningún dígito, el valor es 0.
-Si la letra O parece un cero redondo, trátala como 0.
+ERRORES PROHIBIDOS — NUNCA hagas esto:
+  ✱ ✱ 1  NO es 11, NO es 21 — es SOLO 1
+  ✱ ✱ 2  NO es 12, NO es 22 — es SOLO 2
+  ✱ ✱ 3  NO es 13, NO es 23 — es SOLO 3
+  ✱ ✱ 4  NO es 14, NO es 24, NO es 204 — es SOLO 4
+  ✱ 2 5  NO es 625 — es SOLO 25
+  ✱ 8 6  NO es 786 — es SOLO 86
+  ✱ 3 1  NO es 231 — es SOLO 31
 
-TAMBIÉN extrae estas filas especiales al final de la página 2:
-  - "VOTOS EN BLANCO"      → numero: null, partido: "ESPECIAL"
-  - "VOTOS NULOS"          → numero: null, partido: "ESPECIAL"
-  - "VOTOS NO MARCADOS"    → numero: null, partido: "ESPECIAL"
+VERIFICACIÓN OBLIGATORIA antes de escribir el número:
+  1. Cuenta cuántos dígitos reales (0-9) hay en la casilla.
+  2. Si hay 1 dígito → el valor es ese dígito (ej: 1, 2, 5).
+  3. Si hay 2 dígitos → el valor es esos dos dígitos (ej: 15, 82, 90).
+  4. Si hay 3 dígitos → el valor es esos tres dígitos (ej: 100, 217).
+  5. Los ✱ o • NUNCA cuentan como dígito, no importa cuántos haya.
 
-SUMA TOTAL: en la página 2, última fila "SUMA TOTAL (CANDIDATOS + EN BLANCO + NULOS + NO MARCADOS)".
-Extrae ese número y ponlo en "suma_total" del encabezado. Si no aparece, usa 0.
+TAMBIÉN extrae al final de la página 2:
+  - "VOTOS EN BLANCO"    → numero: null, partido: "ESPECIAL"
+  - "VOTOS NULOS"        → numero: null, partido: "ESPECIAL"
+  - "VOTOS NO MARCADOS"  → numero: null, partido: "ESPECIAL"
 
-PÁGINA 3 (FIRMAS): si solo hay firmas o constancias de jurados, responde con "candidatos": []
+SUMA TOTAL: última fila "SUMA TOTAL (...)" → ponla en "suma_total" del encabezado.
 
-FORMATO DE RESPUESTA (solo JSON puro, sin texto adicional, sin bloques markdown):
+PÁGINA 3 (FIRMAS): responde con "candidatos": []
+
+FORMATO (solo JSON puro, sin markdown):
 {
   "encabezado": {
     "departamento": "TEXTO",
@@ -174,6 +174,8 @@ def extraer_json_de_respuesta(texto: str) -> Optional[dict]:
     return None
 
 def validar_votos(valor) -> int:
+    """Convierte el valor de votos a entero. No aplica correcciones automáticas
+    para no alterar valores legítimos de 3 dígitos (ej: 215, 179, 163)."""
     if valor is None:
         return 0
     try:
@@ -411,11 +413,68 @@ def _escribir_hoja(hoja, df_lugar, col_names, totales_pdf,
         fila += 1
 
 
+def cargar_datos_previos(lugares_nuevos: set[str]) -> tuple[list[dict], dict[str, int]]:
+    """
+    Carga el caché JSON (_cache_votos.json) y devuelve los registros y totales
+    que NO pertenezcan a 'lugares_nuevos' (para no duplicarlos al reprocesar).
+    """
+    registros_prev: list[dict] = []
+    totales_prev: dict[str, int] = {}
+
+    if not RUTA_CACHE_JSON.exists():
+        return registros_prev, totales_prev
+
+    try:
+        with open(RUTA_CACHE_JSON, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+
+        for rec in cache.get("registros", []):
+            if rec.get("Lugar") not in lugares_nuevos:
+                try:
+                    rec["Votos"] = int(float(rec.get("Votos", 0) or 0))
+                except (ValueError, TypeError):
+                    rec["Votos"] = 0
+                registros_prev.append(rec)
+
+        for entrada in cache.get("totales_pdf", []):
+            if entrada.get("Lugar") not in lugares_nuevos:
+                pdf = entrada.get("Archivo_PDF", "")
+                try:
+                    totales_prev[pdf] = int(float(entrada.get("Suma_Total", 0) or 0))
+                except (ValueError, TypeError):
+                    totales_prev[pdf] = 0
+
+        logger.info(f"  ► Caché cargado: {len(registros_prev)} registros previos "
+                    f"(se reprocesarán: {sorted(lugares_nuevos)})")
+    except Exception as e:
+        logger.warning(f"  No se pudo cargar el caché JSON: {e}. Se comenzará desde cero.")
+
+    return registros_prev, totales_prev
+
+
+def guardar_cache_json(registros: list[dict], totales_pdf: dict[str, int],
+                       pdf_a_lugar: dict[str, str]) -> None:
+    """Persiste todos los registros y totales en _cache_votos.json para ejecuciones incrementales."""
+    try:
+        totales_lista = [
+            {"Lugar": pdf_a_lugar.get(pdf, ""), "Archivo_PDF": pdf, "Suma_Total": suma}
+            for pdf, suma in totales_pdf.items()
+        ]
+        cache = {"registros": registros, "totales_pdf": totales_lista}
+        with open(RUTA_CACHE_JSON, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        logger.info(f"  ✓ Caché guardado: {RUTA_CACHE_JSON.name} "
+                    f"({len(registros)} registros, {len(totales_lista)} PDFs)")
+    except Exception as e:
+        logger.warning(f"  No se pudo guardar el caché JSON: {e}")
+
+
 def exportar_a_excel(registros: list[dict], totales_pdf: dict[str, int]) -> None:
     """
     Genera el Excel con:
-      - Hoja CONSOLIDADO: todos los registros con totales por PDF al final de cada grupo.
-      - Una hoja por lugar: misma estructura con totales intercalados tras cada PDF.
+      - Hoja CONSOLIDADO: resumen total por candidato.
+      - Una hoja por lugar: detalle con filas de totales intercaladas.
+    (El caché incremental se guarda en _cache_votos.json, no en el Excel.)
     """
     if not registros:
         logger.warning("No hay registros para exportar.")
@@ -478,6 +537,10 @@ def exportar_a_excel(registros: list[dict], totales_pdf: dict[str, int]) -> None
 
     logger.info(f"  ✓ Hoja 'CONSOLIDADO': {len(resumen)} candidatos únicos")
 
+    # ── Guardar caché JSON para ejecuciones incrementales ────────────────────
+    pdf_a_lugar = dict(zip(df["Archivo_PDF"], df["Lugar"]))
+    guardar_cache_json(registros, totales_pdf, pdf_a_lugar)
+
     # ── Una hoja por lugar ────────────────────────────────────────────────────
     lugares = list(dict.fromkeys(df["Lugar"].tolist()))
     for lugar in lugares:
@@ -516,8 +579,14 @@ def main() -> None:
         logger.error(f"No se encontraron subcarpetas en {RUTA_CARPETA_E14}")
         sys.exit(1)
 
-    todos_los_registros: list[dict] = []
-    totales_pdf: dict[str, int] = {}   # nombre_pdf → suma_total leída del acta
+    # Lugares que se van a procesar en esta ejecución
+    lugares_nuevos = {c.name for c in subcarpetas if any(c.glob("*.pdf")) or any(c.glob("*.PDF"))}
+
+    # Cargar datos previos del caché JSON para los lugares que NO se van a reprocesar
+    registros_previos, totales_previos = cargar_datos_previos(lugares_nuevos)
+
+    todos_los_registros: list[dict] = list(registros_previos)
+    totales_pdf: dict[str, int] = dict(totales_previos)
 
     for carpeta in subcarpetas:
         nombre_lugar = carpeta.name
